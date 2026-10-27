@@ -13,9 +13,34 @@ import numpy as np
 
 from . import hands, media, objects as OB, plan as P, vlm
 from .scan import HAND_NAMES
-from .db import event, get_setting, jd, jl, q, work_dir, x
+from .db import event, get_setting, jd, jl, q, work_dir, x, xc
 
-STATE = {"paused": set(), "current": None, "stop": False, "gen": {}}
+
+class _Paused:
+    """暂停的批次：存在数据库里，网页服务和 worker 进程看到的是同一份"""
+
+    def add(self, bid):
+        x("INSERT OR REPLACE INTO paused(batch_id, ts) VALUES(?,?)", (bid, time.time()))
+
+    def discard(self, bid):
+        x("DELETE FROM paused WHERE batch_id=?", (bid,))
+
+    def __contains__(self, bid):
+        return q("SELECT 1 FROM paused WHERE batch_id=?", (bid,), one=True) is not None
+
+    def __iter__(self):
+        return iter([r["batch_id"] for r in q("SELECT batch_id FROM paused")])
+
+
+class _Gen:
+    """每条录制的版本号：重新排队时加一，正在跑的旧步骤看到版本变了就作废（跨进程）"""
+
+    def get(self, rid, default=0):
+        r = q("SELECT gen FROM rec_gen WHERE rec_id=?", (rid,), one=True)
+        return r["gen"] if r else default
+
+
+STATE = {"paused": _Paused(), "stop": False, "gen": _Gen()}
 
 
 class Cancelled(Exception):
@@ -25,7 +50,7 @@ class Cancelled(Exception):
 def bump(rid):
     """这条录制被重新排队（重新处理 / 重跑某步）：版本号加一。
     正在跑的旧步骤会在下一个检查点退出，跑完的结果也不会写回，避免覆盖新的排队状态"""
-    STATE["gen"][rid] = STATE["gen"].get(rid, 0) + 1
+    x("INSERT INTO rec_gen(rec_id, gen) VALUES(?, 1) ON CONFLICT(rec_id) DO UPDATE SET gen = gen + 1", (rid,))
 _wake = threading.Event()
 
 
@@ -1517,13 +1542,26 @@ def _place(res, sl):
     return best[0] if best else False
 
 
+def _dev(v):
+    return int(v) if v not in (None, "") and str(v).lstrip("-").isdigit() else (v or None)
+
+
 def running_list():
-    return sorted(RUNNING.values(), key=lambda u: u["since"])
+    """所有 worker 正在跑的步骤（从数据库读，网页服务和 worker 都能用）"""
+    return [{"bid": r["bid"], "rid": r["rec_id"], "key": r["key"], "res": r["res"], "dev": _dev(r["dev"]),
+             "since": r["since"], "worker": r["worker"]}
+            for r in q("SELECT * FROM running ORDER BY since")]
 
 
 def is_running(rid, keys=None):
-    u = RUNNING.get(rid)
-    return bool(u) and (keys is None or u["key"] in keys)
+    r = q("SELECT key FROM running WHERE rec_id=?", (rid,), one=True)
+    return bool(r) and (keys is None or r["key"] in keys)
+
+
+def current():
+    """最早开始的那个正在跑的步骤 (bid, rid, key)，没有则 None"""
+    cur = running_list()
+    return (cur[0]["bid"], cur[0]["rid"], cur[0]["key"]) if cur else None
 
 
 def _candidates():
@@ -1558,22 +1596,30 @@ def _dispatch():
             dev = _place(res, sl)
             if dev is False:
                 continue
+            if not _licensed():
+                break
             u = {"bid": j["batch_id"], "rid": j["rec_id"], "key": j["key"], "res": res, "dev": dev, "since": time.time()}
+            # 原子领取：多个 worker 同时看到这一步时，只有一个能把它从 wait 改成 run
+            if not xc("UPDATE steps SET status='run', started=?, progress=0 WHERE rec_id=? AND key=? AND status='wait'",
+                      (u["since"], j["rec_id"], j["key"])):
+                continue
             RUNNING[j["rec_id"]] = u
-            x("UPDATE steps SET status='run', started=?, progress=0 WHERE rec_id=? AND key=?", (u["since"], j["rec_id"], j["key"]))
+            x("INSERT OR REPLACE INTO running(rec_id,bid,key,res,dev,since,worker) VALUES(?,?,?,?,?,?,?)",
+              (j["rec_id"], j["batch_id"], j["key"], res, None if dev is None else str(dev), u["since"], WORKER_ID))
             x("UPDATE recordings SET status='running' WHERE id=?", (j["rec_id"],))
             threading.Thread(target=_run_job, args=(j, u), daemon=True).start()
             started += 1
-        cur = running_list()
-        STATE["current"] = (cur[0]["bid"], cur[0]["rid"], cur[0]["key"]) if cur else None
-        STATE["since"] = cur[0]["since"] if cur else time.time()
     return started
 
 
 def worker():
     """调度线程：有空位就派活；每个任务在自己的线程里跑，跑完叫醒调度线程"""
+    last_beat = 0
     while not STATE["stop"]:
         try:
+            if time.time() - last_beat > 5:
+                last_beat = time.time()
+                _heartbeat()
             n = _dispatch()
         except Exception:  # 任何意外都不能让调度线程退出，否则队列会一直停着
             traceback.print_exc()
@@ -1604,7 +1650,12 @@ def _run_job(j, u):
             c = Ctx(bid, rid, key, on)
             c.gen = gen0
             c.dev = u["dev"] if isinstance(u["dev"], int) else None
-            st, msg, res = fn(c)
+            need = MODULE_OF.get(base)
+            if need and not _has_module(need):
+                from .license import MODULES
+                st, msg, res = "skip", f"许可证未包含“{MODULES.get(need, need)}”", {}
+            else:
+                st, msg, res = fn(c)
         except Cancelled:
             st, msg, res = None, "", {}
         except Exception as e:
@@ -1647,14 +1698,65 @@ def _run_job(j, u):
         with _sched_lock:
             if RUNNING.get(rid) is u:
                 del RUNNING[rid]
-            cur = running_list()
-            STATE["current"] = (cur[0]["bid"], cur[0]["rid"], cur[0]["key"]) if cur else None
+                x("DELETE FROM running WHERE rec_id=? AND worker=?", (rid, WORKER_ID))
         _wake.set()
 
 
+# ============================================================ worker 进程 ==========
+import socket as _socket
+
+WORKER_ID = (os.environ.get("EDP_WORKER_ID") or f"{_socket.gethostname()}-{'w' if os.environ.get('EDP_MODE') == 'server' else 'local'}")[:64]
+STALE_S = 90  # worker 超过这么多秒没有心跳，认为它已经停了，它手上的步骤重新排队
+
+
+MODULE_OF = {"track": "fine", "contact": "fine", "refind": "fine", "objects": "semantic", "semantic": "semantic", "task": "semantic"}
+
+
+def _has_module(m):
+    from . import license as L
+    return L.has_module(m)
+
+
+def _licensed():
+    """许可证有效才派新活（已经在跑的不打断）。检查结果缓存 60 秒"""
+    from . import license as L
+    return L.can_process()
+
+
+def _heartbeat():
+    """登记本 worker 还活着，顺带写上本机资源和空位（网页服务的“运行资源”卡片读这里）；清理已停掉的 worker 留下的任务"""
+    try:
+        sl = slots()
+        info = {"gpus": resources()["gpus"], "cores": resources()["cores"],
+                "slots": {"gpu": {str(k): v for k, v in sl["gpu"].items()}, "vlm": sl["vlm"], "cpu": sl["cpu"],
+                          "total": sl["total"], "local_vlm": sl["local_vlm"]},
+                "oom": {str(k): v for k, v in OOM.items()}}
+    except Exception as e:
+        info = {"err": str(e)}
+    now = time.time()
+    x("INSERT INTO workers(id,host,pid,started,seen,info) VALUES(?,?,?,?,?,?) "
+      "ON CONFLICT(id) DO UPDATE SET pid=excluded.pid, seen=excluded.seen, info=excluded.info",
+      (WORKER_ID, _socket.gethostname(), os.getpid(), now, now, jd(info)))
+    for w in q("SELECT id FROM workers WHERE seen < ? AND id != ?", (now - STALE_S, WORKER_ID)):
+        _requeue_orphans(w["id"])
+        x("DELETE FROM workers WHERE id=?", (w["id"],))
+
+
+def _requeue_orphans(worker_id):
+    for r in q("SELECT rec_id, key FROM running WHERE worker=?", (worker_id,)):
+        x("UPDATE steps SET status='wait', progress=0 WHERE rec_id=? AND key=? AND status='run'", (r["rec_id"], r["key"]))
+    x("DELETE FROM running WHERE worker=?", (worker_id,))
+
+
+def workers():
+    return [dict(w, info=jl(w["info"]), alive=time.time() - (w["seen"] or 0) < STALE_S) for w in q("SELECT * FROM workers ORDER BY id")]
+
+
 def start_worker():
-    # 上次关机时中断的步骤重新排队
-    x("UPDATE steps SET status='wait', progress=0 WHERE status='run'")
+    # 本 worker 上次中断时手上的步骤重新排队；没有任何 worker 登记的“运行中”步骤（旧版本留下的）也重新排队
+    _requeue_orphans(WORKER_ID)
+    x("UPDATE steps SET status='wait', progress=0 WHERE status='run' AND rec_id NOT IN (SELECT rec_id FROM running)")
+    _heartbeat()
     threading.Thread(target=worker, daemon=True).start()
     from . import batchq
     batchq.start()
