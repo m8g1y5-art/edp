@@ -85,7 +85,9 @@ echo.
 echo  具身数据平台已启动：http://127.0.0.1:8765
 echo  浏览器会自动打开。用完关掉这个窗口即可停止。
 echo.
-"%PY%" -m app.server --open
+rem 新版本新增的依赖：旧环境里没有就补装一次
+"%PY%" -c "import cryptography" >nul 2>&1 || "%PY%" -m pip install -q cryptography -i https://pypi.tuna.tsinghua.edu.cn/simple
+"%PY%" launch.py server --open
 echo.
 echo 服务已退出。如果上面有报错，请截图发给我。
 pause

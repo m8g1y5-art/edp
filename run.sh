@@ -38,4 +38,5 @@ export CUDA_VISIBLE_DEVICES="${EDP_GPU:-0}"
 echo "== 启动平台：服务器本机 http://127.0.0.1:${EDP_PORT:-8765}"
 echo "   在 Windows 上另开一个命令行运行： ssh -L 8766:127.0.0.1:${EDP_PORT:-8765} root@<服务器IP>"
 echo "   然后浏览器打开 http://127.0.0.1:8766"
-python -m app.server
+python -c "import cryptography" 2>/dev/null || pip install cryptography $TUNA
+python launch.py server

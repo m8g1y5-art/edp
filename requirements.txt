@@ -8,3 +8,4 @@ pyyaml>=6
 imageio-ffmpeg>=0.5
 pandas<3
 pyarrow<20
+cryptography>=41

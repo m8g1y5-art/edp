@@ -1,0 +1,56 @@
+# 具身数据平台 · 服务器部署
+# 用法：在本目录执行  docker compose up -d     （配置在同目录的 .env 里）
+name: edp
+services:
+  web:
+    image: edp:${EDP_VERSION}
+    restart: unless-stopped
+    command: ["python", "launch.py", "server"]
+    ports: ["${EDP_PORT:-8765}:8765"]
+    environment:
+      EDP_ALLOW_EXTERNAL: ${EDP_ALLOW_EXTERNAL:-}
+      EDP_HTTPS: ${EDP_HTTPS:-0}
+    volumes:
+      - ${EDP_DATA_DIR}:/data
+      - ${EDP_IMPORT_DIR}:/imports:ro
+      - ${EDP_EXPORT_DIR}:/data/exports
+      - /etc/machine-id:/etc/machine-id:ro
+  worker:
+    image: edp:${EDP_VERSION}
+    restart: unless-stopped
+    command: ["python", "launch.py", "worker"]
+    environment:
+      EDP_WORKER_ID: ${EDP_WORKER_ID:-worker1}
+      EDP_ALLOW_EXTERNAL: ${EDP_ALLOW_EXTERNAL:-}
+      NVIDIA_VISIBLE_DEVICES: ${EDP_GPUS:-all}
+    volumes:
+      - ${EDP_DATA_DIR}:/data
+      - ${EDP_IMPORT_DIR}:/imports:ro
+      - ${EDP_EXPORT_DIR}:/data/exports
+      - /etc/machine-id:/etc/machine-id:ro
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+  # 可选：内网的视觉大模型服务（数据完全不出内网时用）。启动：docker compose --profile vlm up -d
+  # 模型文件提前放到 ${EDP_MODEL_DIR}，在网页“设置”里把接口地址填成 http://vlm:8000/v1
+  vlm:
+    profiles: ["vlm"]
+    image: ${EDP_VLM_IMAGE:-vllm/vllm-openai:v0.9.2}
+    restart: unless-stopped
+    command: ["--model", "/models/${EDP_VLM_MODEL:-Qwen2.5-VL-7B-Instruct}", "--served-model-name", "${EDP_VLM_MODEL:-Qwen2.5-VL-7B-Instruct}",
+              "--max-model-len", "16384", "--gpu-memory-utilization", "${EDP_VLM_GPU_MEM:-0.45}"]
+    volumes:
+      - ${EDP_MODEL_DIR:-./models}:/models:ro
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

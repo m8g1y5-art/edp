@@ -85,6 +85,10 @@ VERBS = [x["verb"] for x in DEFAULT_VOCAB]  # 兼容旧代码
 # ============================================================ 组件检查 ===========
 def model_dir():
     """模型文件放在不含中文的路径（Windows 上很多库不支持中文路径）"""
+    if os.environ.get("EDP_MODELS"):  # 安装包里自带的模型目录（Docker 镜像、Windows 安装包）
+        p = Path(os.environ["EDP_MODELS"])
+        p.mkdir(parents=True, exist_ok=True)
+        return p
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
     p = Path(base) / "edp" / "models"
     p.mkdir(parents=True, exist_ok=True)

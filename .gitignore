@@ -8,3 +8,4 @@ dist/
 .venv/
 license/private_key.pem
 *.lic
+tests/dev.lic

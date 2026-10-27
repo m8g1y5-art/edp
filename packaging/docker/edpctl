@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# 具身数据平台 · 运维命令（在安装目录里运行）
+#   ./edpctl status | start | stop | restart | logs [web|worker]
+#   ./edpctl backup              备份数据库（data/backups/）
+#   ./edpctl upgrade <发布包目录>  升级到新版本（自动先备份）
+#   ./edpctl rollback <旧版本号>   回到旧版本并恢复升级前的数据库备份
+#   ./edpctl manage ...          运维命令，如 ./edpctl manage reset-password admin
+#   ./edpctl license <文件>       安装新的许可证
+set -euo pipefail
+cd "$(dirname "$0")"
+C="docker compose"
+ver() { grep ^EDP_VERSION .env | cut -d= -f2; }
+case "${1:-status}" in
+  status)  $C ps; echo; echo "版本：$(ver)"; $C exec -T web python launch.py manage db status 2>/dev/null | head -3 || true ;;
+  start)   $C up -d web worker ;;
+  stop)    $C stop ;;
+  restart) $C up -d --force-recreate web worker ;;
+  logs)    $C logs -f --tail 200 ${2:-} ;;
+  backup)  $C exec -T web python launch.py manage db backup ;;
+  manage)  shift; $C exec web python launch.py manage "$@" ;;
+  license) cp "$2" data/license.lic && $C exec -T web python launch.py manage license show ;;
+  upgrade)
+    PKG="${2:?请给出新版本发布包目录}"; NEW="$(cat "$PKG/VERSION")"; OLD="$(ver)"
+    echo "升级 ${OLD} → ${NEW}"
+    $C exec -T web python launch.py manage db backup
+    docker load -i "$PKG/images/edp-${NEW}.tar.gz"
+    cp "$PKG/docker-compose.yml" "$PKG/edpctl" .
+    sed -i "s#^EDP_VERSION=.*#EDP_VERSION=${NEW}#" .env
+    $C up -d --force-recreate web worker
+    echo "完成。新版本启动时会自动升级数据库（升级前已备份）。旧镜像 edp:${OLD} 保留，可用 ./edpctl rollback ${OLD} 回退。" ;;
+  rollback)
+    OLD="${2:?请给出要回到的版本号}"
+    docker image inspect "edp:${OLD}" >/dev/null || { echo "本机没有 edp:${OLD} 镜像"; exit 1; }
+    $C stop web worker
+    echo "选择要恢复的数据库备份（升级前的那一个，文件名里带 -v旧版本号）："
+    ls -t data/backups/ | head -10
+    read -rp "备份文件名：" BK
+    sed -i "s#^EDP_VERSION=.*#EDP_VERSION=${OLD}#" .env
+    $C run --rm -T web sh -c "echo yes | python launch.py manage db rollback ${BK}"
+    $C up -d web worker ;;
+  *) sed -n '2,10p' "$0" ;;
+esac

@@ -1,0 +1,11 @@
+.git
+data
+dist
+build
+tools
+tests
+packaging/windows
+**/__pycache__
+*.lic
+*.pem
+*.bundle
