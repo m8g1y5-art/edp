@@ -1,14 +1,19 @@
 """SQLite 存储：批次、录制、步骤任务、事件、设置。
 大块结果（时间戳、关键点、分段）放在工作区文件里，数据库只存状态和小 JSON。"""
 import json
+import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "data"
-DATA.mkdir(exist_ok=True)
+# 数据目录：默认在程序目录下的 data\；服务器部署时用环境变量 EDP_DATA 指到数据盘或 NAS
+DATA = Path(os.environ.get("EDP_DATA") or (ROOT / "data")).resolve()
+DATA.mkdir(parents=True, exist_ok=True)
+# 运行模式：single = 单机（网页服务里直接跑处理，不需要登录）；server = 服务器（处理由独立的 worker 进程跑，需要登录）
+MODE = (os.environ.get("EDP_MODE") or "single").strip().lower()
+SERVER = MODE == "server"
 DB_PATH = DATA / "app.db"
 _lock = threading.RLock()
 
@@ -68,6 +73,14 @@ def x(sql, args=()):
     with _lock:
         db().execute(sql, args)
         db().commit()
+
+
+def xc(sql, args=()):
+    """执行一条写语句，返回受影响的行数（多个进程抢同一个任务时用来判断谁抢到了）"""
+    with _lock:
+        n = db().execute(sql, args).rowcount
+        db().commit()
+    return n
 
 
 def jl(s, default=None):
@@ -155,30 +168,25 @@ _MIGRATIONS = {
 
 
 def migrate():
-    # 层级：项目 → 批次 → 录制。老数据库补列，没有归属的批次放进“默认项目”
-    cols = {r["name"] for r in q("PRAGMA table_info(batches)")}
-    for col, ddl in (("project_id", "TEXT"), ("prio", "INTEGER DEFAULT 0"), ("note", "TEXT DEFAULT ''")):
-        if col not in cols:
-            x(f"ALTER TABLE batches ADD COLUMN {col} {ddl}")
-    if not q("SELECT 1 FROM projects", one=True):
-        x("INSERT INTO projects(id,name,note,created) VALUES('default','默认项目','',?)", (time.time(),))
-    first = q("SELECT id FROM projects ORDER BY created LIMIT 1", one=True)["id"]
-    x("UPDATE batches SET project_id=? WHERE project_id IS NULL OR project_id='' OR project_id NOT IN (SELECT id FROM projects)", (first,))
+    """启动时调用：先按版本号升级数据库结构（升级前自动备份），再套用默认值更新和部署预设"""
+    from . import migrations
+    migrations.upgrade()
     for flag, vals in _MIGRATIONS.items():
         if not q("SELECT 1 FROM settings WHERE key=?", (flag,), one=True):
             for k, v in vals.items():
                 x("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, jd(v)))
             x("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (flag, jd(True)))
-    # 部署预设：程序根目录下的 preset.json（例如本机 Mage-VL 语义服务的地址），每个文件内容只套用一次
-    pf = ROOT / "preset.json"
-    if pf.exists():
+    # 部署预设：程序根目录（或数据目录）下的 preset.json，每个文件内容只套用一次
+    for pf in (ROOT / "preset.json", DATA / "preset.json"):
+        if not pf.exists():
+            continue
         try:
             raw = pf.read_text(encoding="utf-8")
             flag = "preset_" + __import__("hashlib").sha1(raw.encode()).hexdigest()[:10]
             if not q("SELECT 1 FROM settings WHERE key=?", (flag,), one=True):
                 for k, v in json.loads(raw).items():
                     if not k.startswith("_"):
-                        x("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, jd(v)))
+                        set_setting(k, v)
                 x("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (flag, jd(True)))
         except Exception as e:
             print("preset.json 读取失败：", e)
