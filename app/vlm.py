@@ -2,6 +2,7 @@
 设置项 vlm_backend = "ollama" | "api"。上层代码只调用 status / need_model / ask / unload，不关心用的是哪种。"""
 import base64
 import json
+import os
 import re
 import time
 import urllib.error
@@ -46,9 +47,45 @@ def backend():
     return get_setting("vlm_backend") or "ollama"
 
 
+def is_internal(url):
+    """接口地址是不是在客户内网里：本机、私有网段、没有点的主机名（如 Docker 里的服务名 vlm）"""
+    import ipaddress
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if not host or host in ("localhost",) or "." not in host or host.endswith(".local") or host.endswith(".internal"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback
+    except ValueError:
+        return False
+
+
+def external_allowed():
+    """外部大模型接口总开关：环境变量 EDP_ALLOW_EXTERNAL=0/1 优先（部署时写死），否则看管理员的设置"""
+    env = os.environ.get("EDP_ALLOW_EXTERNAL")
+    if env is not None and env.strip() != "":
+        return env.strip() not in ("0", "false", "no")
+    v = get_setting("allow_external")
+    return True if v is None else bool(v)
+
+
+def external_locked():
+    return (os.environ.get("EDP_ALLOW_EXTERNAL") or "").strip() != ""
+
+
+def guard(url):
+    if not is_internal(url) and not external_allowed():
+        raise RuntimeError("外部大模型接口已被管理员关闭（数据不出内网）：请改用本地模型，或在设置里由管理员重新开启")
+
+
 def api_status():
     """外部接口：只检查有没有填 Key 和模型名，不每次都联网（真正能不能用，点“测试模型”或跑任务时就知道）"""
     key, model = get_setting("api_key") or "", get_setting("api_model") or ""
+    base = get_setting("api_base") or DASHSCOPE_BASE
+    if not is_internal(base) and not external_allowed():
+        return {"ok": False, "err": "外部大模型接口已被管理员关闭：请把接口地址改成内网的本地模型服务", "models": [], "model": None, "backend": "api"}
+    if is_internal(base) and not key:
+        key = "local"
     if not key:
         return {"ok": False, "err": "外部接口还没有填 API Key（设置页）", "models": [], "model": None, "backend": "api"}
     if not model:
@@ -203,6 +240,7 @@ DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # 阿里�
 
 def _api_post(path, body, timeout):
     base = (get_setting("api_base") or DASHSCOPE_BASE).rstrip("/")
+    guard(base)
     req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json",
                                           "Authorization": "Bearer " + (get_setting("api_key") or "")})

@@ -13,12 +13,39 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import batchq, pipeline, plan as P, scan, vlm
-from .db import DATA, ROOT, all_settings, event, get_setting, jd, jl, q, set_setting, work_dir, x
+from . import auth, batchq, pipeline, plan as P, scan, vlm
+from . import license as LIC
+from .version import VERSION
+from .db import DATA, ROOT, SERVER, all_settings, event, get_setting, jd, jl, q, set_setting, work_dir, x
 
 app = FastAPI(title="具身数据平台")
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+@app.middleware("http")
+async def _auth(request, call_next):
+    """登录与权限：服务器模式下 /api/ 接口要先登录；管理员专属的操作，标注员调用会被拒绝。所有写操作记进操作日志"""
+    path, method = request.url.path, request.method
+    ip = request.client.host if request.client else ""
+    user = auth.user_of(request.cookies.get(auth.COOKIE))
+    request.state.user = user
+    if not auth.is_public(path):
+        if not user:
+            return JSONResponse({"detail": "请先登录"}, status_code=401)
+        if auth.needs_admin(method, path) and user["role"] != "admin":
+            auth.audit(user, method, path, 403, "无权限", ip)
+            return JSONResponse({"detail": "这个操作需要管理员权限"}, status_code=403)
+    try:
+        resp = await call_next(request)
+    except ValueError as e:  # 例如非法的批次号
+        return JSONResponse({"detail": str(e)}, status_code=400)
+    if path.startswith("/api/") and method in ("POST", "PUT", "DELETE") and path not in ("/api/login", "/api/logout"):
+        try:
+            auth.audit(user, method, path, resp.status_code, "", ip)
+        except Exception:
+            pass
+    return resp
 
 
 @app.middleware("http")
@@ -80,26 +107,43 @@ def gpu_info():
 
 @app.get("/api/resources")
 def res_report():
-    """本机资源和调度空位（设置页“运行资源”卡片）"""
-    r = pipeline.resources(force=True)
-    sl = pipeline.slots()
+    """本机资源和调度空位（设置页“运行资源”卡片）。服务器模式下读各 worker 登记的资源"""
     runs = []
     for u in pipeline.running_list():
         m = q("SELECT s.label, r.name FROM steps s JOIN recordings r ON r.id=s.rec_id WHERE s.rec_id=? AND s.key=?", (u["rid"], u["key"]), one=True) or {}
         runs.append({"rec": m.get("name") or u["rid"], "label": m.get("label") or u["key"], "res": u["res"],
                      "dev": u["dev"] if isinstance(u["dev"], int) else None, "sec": round(time.time() - u["since"])})
+    if SERVER:
+        ws = pipeline.workers()
+        alive = [w for w in ws if w["alive"]]
+        w0 = alive[0]["info"] if alive else {}
+        return {"gpus": [g for w in alive for g in w["info"].get("gpus", [])], "cores": sum(w["info"].get("cores", 0) for w in alive),
+                "slots": w0.get("slots") or {"gpu": {}, "vlm": 0, "cpu": 0, "total": 0, "local_vlm": False}, "oom": w0.get("oom", {}),
+                "running": runs, "workers": [{"id": w["id"], "host": w["host"], "alive": w["alive"], "seen": round(time.time() - (w["seen"] or 0)),
+                                              "gpus": w["info"].get("gpus", []), "slots": w["info"].get("slots")} for w in ws]}
+    r = pipeline.resources(force=True)
+    sl = pipeline.slots()
     return {"gpus": r["gpus"], "cores": r["cores"], "slots": {"gpu": {str(k): v for k, v in sl["gpu"].items()}, "vlm": sl["vlm"],
             "cpu": sl["cpu"], "total": sl["total"], "local_vlm": sl["local_vlm"]}, "oom": {str(k): v for k, v in pipeline.OOM.items()},
             "running": runs}
 
 
 @app.get("/api/sys")
-def sys_status():
+def sys_status(req: Request):
+    out = _sys_status()
+    if (getattr(req.state, "user", None) or {}).get("role") != "admin":
+        out.pop("data_dir", None)
+    out["mode"] = "server" if SERVER else "single"
+    out["version"] = VERSION
+    return out
+
+
+def _sys_status():
     du = shutil.disk_usage(DATA)
-    cur = pipeline.STATE["current"]
+    cur = pipeline.current()
     wait = q("SELECT COUNT(*) n FROM steps WHERE status='wait'", one=True)["n"]
     return {"gpu": gpu_info(), "vlm": vlm.status(), "disk_free": du.free, "disk_total": du.total,
-            "data_dir": str(DATA), "current": cur, "running": len(pipeline.RUNNING), "queue": wait, "python": sys.version.split()[0],
+            "data_dir": str(DATA), "current": cur, "running": len(pipeline.running_list()), "queue": wait, "python": sys.version.split()[0],
             "work_bytes": _dir_size(DATA / "batches")}
 
 
@@ -132,16 +176,28 @@ def _polys(bid, rid):
     return None
 
 
+def _settings_view():
+    st = all_settings(mask=True)
+    st["allow_external"] = vlm.external_allowed()
+    st["allow_external_locked"] = vlm.external_locked()
+    return st
+
+
 @app.get("/api/settings")
 def get_settings():
-    return all_settings()
+    return _settings_view()
 
 
 @app.put("/api/settings")
 async def put_settings(req: Request):
-    for k, v in (await req.json()).items():
+    body = await req.json()
+    if "allow_external" in body and vlm.external_locked():
+        body.pop("allow_external")  # 部署时用环境变量定死的，界面上改不了
+    for k, v in body.items():
+        if k in ("allow_external_locked", "license_seen"):
+            continue
         set_setting(k, v)
-    return all_settings()
+    return _settings_view()
 
 
 @app.get("/api/vocab")
@@ -376,7 +432,8 @@ def batchq_test():
 # ---------------------------------------------------------------- 任务队列 ----
 @app.get("/api/queue")
 def queue():
-    cur = pipeline.STATE["current"]
+    runs = pipeline.running_list()
+    cur = (runs[0]["bid"], runs[0]["rid"], runs[0]["key"]) if runs else None
     rows = q("""SELECT b.id, b.name, b.prio, b.created, b.project_id, p.name pname,
                 SUM(s.status='wait') wait, SUM(s.status='run') run, SUM(s.status='batch') bwait, SUM(s.status IN ('ok','warn')) done, SUM(s.status='fail') fail,
                 SUM(s.status!='skip') total
@@ -389,7 +446,7 @@ def queue():
               (cur[1], cur[2]), one=True)
         if m:
             live = {"bid": cur[0], "rid": cur[1], "key": cur[2], "label": m["label"], "rec": m["name"], "progress": m["progress"],
-                    "msg": m["msg"], "since": round(time.time() - pipeline.STATE.get("since", time.time()))}
+                    "msg": m["msg"], "since": round(time.time() - runs[0]["since"])}
     for r in rows:
         r["paused"] = r["id"] in pipeline.STATE["paused"]
     return {"live": live, "batches": rows}
@@ -405,6 +462,42 @@ async def set_prio(bid: str, req: Request):
     return {"ok": True}
 
 
+def import_roots():
+    """服务器模式下允许导入的目录：EDP_IMPORT_ROOTS（多个用 ; 或 : 分隔），默认是数据目录下的 imports"""
+    raw = os.environ.get("EDP_IMPORT_ROOTS") or ""
+    roots = [Path(p) for p in raw.replace(";", ":").split(":") if p.strip()] or [DATA / "imports"]
+    for r in roots:
+        try:
+            r.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    return roots
+
+
+def _under_import_roots(p):
+    p = p.resolve()
+    return any(p == r.resolve() or r.resolve() in p.parents for r in import_roots())
+
+
+@app.get("/api/import/roots")
+def import_roots_api():
+    """可导入的目录和它们下面的文件夹（服务器模式的导入页用来选文件夹）"""
+    out = []
+    for r in import_roots():
+        subs = []
+        try:
+            for d in sorted(r.iterdir()):
+                if d.is_dir() and not d.name.startswith("."):
+                    subs.append({"name": d.name, "path": str(d)})
+                    for d2 in sorted(d.iterdir())[:200]:
+                        if d2.is_dir() and not d2.name.startswith("."):
+                            subs.append({"name": d.name + "/" + d2.name, "path": str(d2)})
+        except Exception:
+            pass
+        out.append({"root": str(r), "dirs": subs[:500]})
+    return {"server": SERVER, "roots": out}
+
+
 @app.post("/api/batches")
 async def create_batch(req: Request):
     body = await req.json()
@@ -412,6 +505,8 @@ async def create_batch(req: Request):
     mode = body.get("mode", "path")
     if mode == "path":
         src = Path(body["path"].strip().strip('"'))
+        if SERVER and not _under_import_roots(src):
+            raise HTTPException(400, "只能导入这些目录下的文件夹：" + "、".join(str(r) for r in import_roots()))
         if not src.exists() or not src.is_dir():
             raise HTTPException(400, f"找不到文件夹：{src}")
     else:
@@ -584,6 +679,9 @@ def rescan(bid: str):
 # ---------------------------------------------------------------- 处理 ----
 @app.post("/api/batches/{bid}/start")
 async def start(bid: str, req: Request):
+    lst = LIC.status()
+    if not lst["valid"]:
+        raise HTTPException(403, f"不能开始处理：{lst['reason']}。请联系供应商获取许可证，管理员在“设置 → 授权”上传")
     b = batch(bid)
     try:
         body = await req.json()
@@ -842,7 +940,7 @@ def media_file(bid: str, rid: str, name: str):
 
 
 # ---------------------------------------------------------------- 导出 ----
-EXPORTS = DATA / "exports"
+EXPORTS = Path(os.environ.get("EDP_EXPORTS") or (DATA / "exports"))  # 可直接指到客户的训练数据存储
 
 
 @app.get("/api/exports")
@@ -863,7 +961,11 @@ def list_exports():
 async def export(req: Request):
     body = await req.json()
     from . import exporter
-    name = body.get("name") or time.strftime("dataset_%m%d_%H%M")
+    name = (body.get("name") or time.strftime("dataset_%m%d_%H%M")).strip()
+    import re as _re
+    if not _re.fullmatch(r"[^\\/:*?\"<>|]{1,80}", name) or name.startswith("."):
+        raise HTTPException(400, "数据集名称不能包含 \\ / : * ? \" < > | 这些字符")
+    EXPORTS.mkdir(parents=True, exist_ok=True)
     out = EXPORTS / name
     if out.exists():
         raise HTTPException(400, "同名数据集已存在")
@@ -872,6 +974,8 @@ async def export(req: Request):
         r = next(r for r in recs_of(it["bid"]) if r["id"] == it["rid"])
         items.append((it["bid"], r))
     opts = body.get("opts", {})
+    if opts.get("format", "lerobot") == "lerobot" and not LIC.has_module("lerobot"):
+        raise HTTPException(403, "许可证无效或未包含 LeRobot 导出，可以先用“平台原格式”导出")
     if opts.get("format", "lerobot") == "lerobot":
         from . import exporter_lerobot
         threading.Thread(target=exporter_lerobot.export, args=(out, items, opts), daemon=True).start()
@@ -898,6 +1002,8 @@ def exportable():
 @app.post("/api/open")
 async def open_path(req: Request):
     p = (await req.json())["path"]
+    if SERVER:
+        return {"ok": False, "msg": "服务器部署时不能在服务器上打开文件夹，请到数据目录里查看"}
     if os.name == "nt":
         os.startfile(p)  # 在资源管理器里打开
         return {"ok": True}
@@ -968,20 +1074,129 @@ def sam_install():
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- 账号与权限 ----
+@app.post("/api/login")
+async def login_api(req: Request):
+    b = await req.json()
+    ip = req.client.host if req.client else ""
+    try:
+        tok, u = auth.login(b.get("username"), b.get("password"), ip)
+    except PermissionError as e:
+        auth.audit({"username": (b.get("username") or "")[:32]}, "POST", "/api/login", 401, str(e), ip)
+        raise HTTPException(401, str(e))
+    auth.audit(u, "POST", "/api/login", 200, "登录", ip)
+    resp = JSONResponse({"ok": True, "user": u})
+    resp.set_cookie(auth.COOKIE, tok, max_age=auth.SESSION_DAYS * 86400, httponly=True, samesite="lax",
+                    secure=os.environ.get("EDP_HTTPS") == "1")
+    return resp
+
+
+@app.post("/api/logout")
+def logout_api(req: Request):
+    auth.logout(req.cookies.get(auth.COOKIE))
+    auth.audit(getattr(req.state, "user", None), "POST", "/api/logout", 200, "退出", req.client.host if req.client else "")
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(auth.COOKIE)
+    return resp
+
+
+@app.get("/api/me")
+def me(req: Request):
+    u = getattr(req.state, "user", None)
+    lst = LIC.status()
+    lic = {"valid": lst["valid"], "reason": lst["reason"], "days_left": lst["days_left"], "warn": lst["warn"],
+           "customer": (lst["info"] or {}).get("customer"), "edition": (lst["info"] or {}).get("edition"),
+           "expires": (lst["info"] or {}).get("expires")}
+    return {"user": u, "mode": "server" if SERVER else "single", "version": VERSION, "license": lic,
+            "roles": auth.ROLES, "needs_setup": SERVER and not auth.has_users()}
+
+
+@app.put("/api/me/password")
+async def my_password(req: Request):
+    b = await req.json()
+    u = req.state.user
+    if not SERVER:
+        raise HTTPException(400, "单机模式没有账号")
+    row = q("SELECT pw FROM users WHERE id=?", (u["id"],), one=True)
+    if not row or not auth.check_pw(b.get("old") or "", row["pw"]):
+        raise HTTPException(400, "原密码不对")
+    try:
+        auth.update_user(u["id"], pw=b.get("new"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.get("/api/users")
+def users_api():
+    return auth.users()
+
+
+@app.post("/api/users")
+async def create_user_api(req: Request):
+    b = await req.json()
+    try:
+        return auth.create_user(b.get("username"), b.get("password"), b.get("role") or "annotator", b.get("name") or "")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.put("/api/users/{uid}")
+async def update_user_api(uid: int, req: Request):
+    b = await req.json()
+    try:
+        return auth.update_user(uid, role=b.get("role"), name=b.get("name"), disabled=b.get("disabled"), pw=b.get("password"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/audit")
+def audit_api(limit: int = 200, before: int = None, user: str = None):
+    return auth.audit_rows(limit, before, user)
+
+
+# ---------------------------------------------------------------- 许可证 ----
+@app.get("/api/license")
+def license_api(req: Request):
+    st = dict(LIC.status(force=True))
+    st["modules_all"] = LIC.MODULES
+    st["gpus"] = LIC.gpu_count()
+    if (getattr(req.state, "user", None) or {}).get("role") != "admin":
+        st.pop("path", None)
+    return st
+
+
+@app.post("/api/license")
+async def license_upload(file: UploadFile = File(...)):
+    text = (await file.read()).decode("utf-8", errors="ignore")
+    try:
+        return LIC.install(text)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/workers")
+def workers_api():
+    return pipeline.workers()
+
+
 @app.on_event("startup")
 def _start():
     from .db import migrate
     migrate()
-    pipeline.start_worker()
+    if not SERVER:  # 单机模式：处理就在网页服务里跑；服务器模式由独立的 worker 进程（python -m app.worker）跑
+        pipeline.start_worker()
 
 
 def main():
     import uvicorn
     port = int(os.environ.get("EDP_PORT", "8765"))
+    # 单机只对本机开放；服务器模式默认对局域网开放（有登录保护），可用 EDP_HOST 改
+    host = os.environ.get("EDP_HOST") or ("0.0.0.0" if SERVER else "127.0.0.1")
     if "--open" in sys.argv:
         import webbrowser
         threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":

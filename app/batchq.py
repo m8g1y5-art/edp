@@ -131,6 +131,8 @@ def _headers(extra=None):
 def _http(method, path, body=None, raw=None, ctype=None, timeout=120):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     hdr = _headers({"Content-Type": ctype or "application/json"} if data is not None else None)
+    from .vlm import guard
+    guard(_base())
     req = urllib.request.Request(_base() + path, data=data, headers=hdr, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:

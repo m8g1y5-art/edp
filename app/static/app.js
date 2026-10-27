@@ -5,10 +5,17 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const T = s => `data-tip="${String(s).replace(/"/g,'&quot;')}"`;
 const api = async (url, opt={}) => {
-  const r = await fetch(url, {headers:{'Content-Type':'application/json'}, ...opt, body: opt.body && typeof opt.body !== 'string' && !(opt.body instanceof FormData) ? JSON.stringify(opt.body) : opt.body});
+  const hdr = opt.body instanceof FormData ? {} : {'Content-Type':'application/json'};
+  const r = await fetch(url, {headers: hdr, ...opt, body: opt.body && typeof opt.body !== 'string' && !(opt.body instanceof FormData) ? JSON.stringify(opt.body) : opt.body});
+  if (r.status === 401 && !url.startsWith('/api/login') && !url.startsWith('/api/me')) { showLogin(); throw new Error('请先登录'); }
   if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m } catch(e){} throw new Error(m); }
   return r.json();
 };
+/* 当前登录的人、运行模式、许可证（启动时读一次） */
+let ME = {user: null, mode: 'single', license: {valid: true}, version: ''};
+const isAdmin = () => !ME.user || ME.user.role === 'admin';
+const SERVER = () => ME.mode === 'server';
+window.addEventListener('unhandledrejection', e => { if (e.reason && e.reason.message && e.reason.message !== '请先登录') toast(e.reason.message); });
 const fmtDur = s => { s = Math.round(s||0); if (s < 60) return s + ' 秒'; if (s < 3600) return Math.floor(s/60) + ':' + String(s%60).padStart(2,'0'); return Math.floor(s/3600) + ':' + String(Math.floor(s%3600/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0'); };
 // 批次实际用到的大模型（来自分段结果和物体清单，不是当前设置）。多个模型时都列出，按段数排序
 const modelCell = ms => {
@@ -74,6 +81,7 @@ async function route() {
   const fn = routes[name] || routes[''];
   const want = SCROLL[location.hash || '#/'] || 0;
   try { await fn(...parts.slice(1)); } catch (e) { $('#main').innerHTML = `<div class="empty">出错了：${esc(e.message)}</div>`; console.error(e); }
+  drawBanner();
   // 内容是异步画出来的：等几帧再滚回原位置，直到页面够高
   if (want) { let n = 0; const go = () => { window.scrollTo(0, want); if (Math.abs(window.scrollY - want) > 2 && n++ < 40) setTimeout(go, 100); }; go(); }
   else window.scrollTo(0, 0);
@@ -81,7 +89,7 @@ async function route() {
 // 离开页面时记住滚动位置；回到同一页面时恢复。“项目”栏记住最后看的页面，从任务队列等处点回来时回到那里
 const SCROLL = {};
 window.addEventListener('hashchange', e => { try { SCROLL[new URL(e.oldURL).hash || '#/'] = window.scrollY; } catch (err) {} route(); });
-document.querySelectorAll('nav a').forEach(a => a.addEventListener('click', e => {
+document.querySelectorAll('nav a[data-r]').forEach(a => a.addEventListener('click', e => {
   if (a.dataset.r === 'projects' && navKey !== 'projects' && S.lastProjHash) { e.preventDefault(); location.hash = S.lastProjHash; }
 }));
 
@@ -107,7 +115,7 @@ async function sysTick() {
     const memp = g ? Math.round(g.mem_used / g.mem_total * 100) : 0;
     $('#sys').innerHTML = `
       <div class="si" ${T(g ? `<b>${esc(g.name)}</b><br>利用率 ${g.util}% · 显存 ${(g.mem_used/1024).toFixed(1)}/${(g.mem_total/1024).toFixed(1)} GB · ${g.temp}°C` : '没检测到 NVIDIA 显卡（nvidia-smi 不可用）')}><b>${g ? g.util + '%' : '—'}</b><div class="gauge"><i style="width:${memp}%"></i></div></div>
-      <div class="si" ${T((v.ok ? (v.model ? '视觉模型：<b>' + esc(v.model) + '</b><br>在“设置”里可更换' : 'Ollama 在运行，但没有找到视觉模型') : esc(v.err || '模型未连接')) + `<br>队列 ${s.queue} 步<br>磁盘可用 ${fmtB(s.disk_free)}<br><span class=tk>${esc(s.data_dir)}</span>`)}><i class="dot" style="background:${v.model ? 'var(--ok)' : v.ok ? 'var(--warn)' : 'var(--bad)'}"></i></div>`;
+      <div class="si" ${T((v.ok ? (v.model ? '视觉模型：<b>' + esc(v.model) + '</b><br>在“设置”里可更换' : 'Ollama 在运行，但没有找到视觉模型') : esc(v.err || '模型未连接')) + `<br>队列 ${s.queue} 步<br>磁盘可用 ${fmtB(s.disk_free)}${s.data_dir ? `<br><span class=tk>${esc(s.data_dir)}</span>` : ''}`)}><i class="dot" style="background:${v.model ? 'var(--ok)' : v.ok ? 'var(--warn)' : 'var(--bad)'}"></i></div>`;
     $('#qn').textContent = s.queue || '';
   } catch (e) { $('#sys').innerHTML = `<div class="si" ${T('后台未响应')}><i class="dot" style="background:var(--bad)"></i></div>`; }
 }
@@ -241,6 +249,16 @@ routes['import'] = async (pid) => {
     <b>单条录制</b>：文件夹里直接是这一条的彩色视频、深度、关键点、标定等文件。<br>
     <b>多条录制</b>：文件夹里是几十上百个子文件夹，每个子文件夹一条录制。系统会逐条识别，把文件结构相同的归成一组，预检页给出整批的结论和每一条的结果。<br>
     认识的格式：视频（mp4 / mov / mkv，含 16 位深度 mkv）、图片序列（含 16 位深度 PNG）、时间戳表、IMU / 位姿 / 关节 / 夹爪 / 力（csv / txt，按列名识别）、手部关键点 JSON、标定（yaml / json）、任务说明 JSON、URDF。认不出来的文件单独列出，不影响其他数据。</div></div>`;
+  if (SERVER()) {  // 服务器部署：只能导入服务器上指定目录里的文件夹
+    const ir = await api('/api/import/roots').catch(() => ({roots: []}));
+    const card = $('#path').closest('.card');
+    card.querySelector('h2').textContent = '服务器上的文件夹（推荐）';
+    $('#path').placeholder = '从下拉里选，或输入服务器上的路径';
+    $('#path').setAttribute('list', 'irl');
+    card.querySelector('.hint').innerHTML = `直接读取服务器上原位置的文件，不复制，适合大数据量。可以导入这些目录下的文件夹：<br>${ir.roots.map(r => `<span class="mono">${esc(r.root)}</span>`).join('<br>')}<br><span class="k">数据先由管理员拷到上面的目录（或挂载的网络盘）里。</span>`
+      + `<datalist id="irl">${ir.roots.flatMap(r => r.dirs).map(d => `<option value="${esc(d.path)}">${esc(d.name)}</option>`).join('')}</datalist>`;
+    $('#upst').textContent = '文件会通过浏览器上传到服务器的数据目录。几 GB 以内适用。';
+  }
   const body = extra => ({...extra, project_id: $('#pj').value, name: $('#bname').value.trim() || extra.name});
   $('#newp').onclick = async () => { const n = await ask('新建项目'); if (!n) return; const r = await api('/api/projects', {method:'POST', body:{name:n}}); location.hash = '#/import/' + r.id; };
   $('#pj').onchange = () => { setLastP($('#pj').value); };
@@ -1295,7 +1313,8 @@ async function resCard(st) {
     <dl class="kv" style="margin-top:10px"><dt>显卡</dt><dd>${g}</dd><dt>CPU</dt><dd>${m.cores} 个逻辑核 · 同时 ${m.slots.cpu} 个 CPU 步骤</dd>
     <dt>大模型</dt><dd>${m.slots.local_vlm ? '本机模型：和第 1 张显卡上的跟踪轮流用' : `外部接口：同时 ${m.slots.vlm} 个请求`}</dd>
     <dt>总并发</dt><dd>最多 ${m.slots.total} 个步骤同时跑</dd>
-    <dt>正在跑</dt><dd>${m.running.length ? m.running.map(r => `${esc(shortText(r.rec))} · ${esc(r.label)} <span class="k">${RES[r.res] || r.res}${r.dev != null ? ' #' + r.dev : ''} · ${r.sec} 秒</span>`).join('<br>') : '<span class="k">空闲</span>'}</dd></dl>
+    <dt>正在跑</dt><dd>${m.running.length ? m.running.map(r => `${esc(shortText(r.rec))} · ${esc(r.label)} <span class="k">${RES[r.res] || r.res}${r.dev != null ? ' #' + r.dev : ''} · ${r.sec} 秒</span>`).join('<br>') : '<span class="k">空闲</span>'}</dd>
+    ${m.workers ? `<dt>处理进程</dt><dd>${m.workers.length ? m.workers.map(w => `<i class="dot" style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${w.alive ? 'var(--ok)' : 'var(--bad)'}"></i> <span class="mono">${esc(w.id)}</span> <span class="k">${w.gpus.length} 张卡 · ${w.alive ? w.seen + ' 秒前在线' : '已离线'}</span>`).join('<br>') : '<span style="color:var(--bad)">没有在运行的 worker，任务不会被处理</span>'}</dd>` : ''}</dl>
     <div class="row"><span ${T('所有步骤加起来最多同时跑几个。0 = 自动（按上面的空位）。<br>填 1 = 和以前一样，一次只跑一个步骤；机器上还有别的程序要用显卡、CPU 时可以调小')}>总并发上限</span><input type="number" id="rmax" min="0" max="64" value="${st.max_jobs ?? 0}"></div>
     <div class="row"><span ${T('每张显卡同时跑几个物体跟踪。0 = 自动（按显存，每个约 4 GB）。<br>显存不够时软件会自动减一个并重跑那一步')}>每张卡同时跟踪</span><input type="number" id="rgpu" min="0" max="8" value="${st.gpu_jobs ?? 0}"></div>
     <div class="row"><span ${T('用外部接口（百炼）实时调用时，同时发几个请求。太多会被限流（HTTP 429），软件会自动等一会儿重试')}>外部接口同时请求</span><input type="number" id="rapi" min="1" max="32" value="${st.api_parallel ?? 4}"></div>
@@ -1367,16 +1386,29 @@ routes['settings'] = async () => {
     </div></div>
     <div class="card"><h2>运行资源</h2><div class="bd form" id="resc"><div class="k">读取中…</div></div></div>
     <div class="card"><h2>精细标注（物体跟踪）</h2><div class="bd form" id="samc"><div class="k">读取中…</div></div></div>
-    <div class="card"><h2>本机</h2><div class="bd"><dl class="kv">
+    <div class="card"><h2>${SERVER() ? '服务器' : '本机'}</h2><div class="bd"><dl class="kv">
       <dt>显卡</dt><dd>${sy.gpu ? esc(sy.gpu.name) + ' · ' + (sy.gpu.mem_total/1024).toFixed(0) + ' GB' : '未检测到'}</dd>
       <dt>Python</dt><dd>${esc(sy.python)}</dd>
-      <dt>数据目录</dt><dd>${esc(sy.data_dir)}</dd>
+      <dt>版本</dt><dd>${esc(sy.version || '')}${SERVER() ? ' · 服务器模式' : ' · 单机模式'}</dd>
+      ${sy.data_dir ? `<dt>数据目录</dt><dd>${esc(sy.data_dir)}</dd>` : ''}
       <dt>处理缓存</dt><dd>${fmtB(sy.work_bytes)}</dd>
       <dt>磁盘可用</dt><dd>${fmtB(sy.disk_free)} / ${fmtB(sy.disk_total)}</dd></dl>
-      <div style="margin-top:12px;display:flex;gap:8px"><button class="btn" id="clean">清理预览视频缓存</button><button class="btn" data-open="${esc(sy.data_dir)}">打开数据目录</button></div>
+      <div style="margin-top:12px;display:flex;gap:8px"><button class="btn" id="clean">清理预览视频缓存</button>${SERVER() || !sy.data_dir ? '' : `<button class="btn" data-open="${esc(sy.data_dir)}">打开数据目录</button>`}</div>
       <div class="hint">清理后可在浏览页重跑“入库”重新生成预览。原始数据从不改动。</div></div></div>
+    <div class="card"><h2>授权</h2><div class="bd form" id="licc"><div class="k">读取中…</div></div></div>
     <div class="card" style="grid-column:1/-1"><h2>动作词表<span class="sp"></span><span class="k" id="vver"></span></h2><div class="bd" id="vocab"><div class="k">读取中…</div></div></div>
+    ${SERVER() && isAdmin() ? `<div class="card" style="grid-column:1/-1"><h2>账号<span class="sp"></span><button class="btn sm" id="uadd">添加账号</button></h2><div class="bd" id="usersc"><div class="k">读取中…</div></div></div>
+    <div class="card" style="grid-column:1/-1"><h2>操作日志<span class="sp"></span><span class="k">最近 200 条写操作和登录</span></h2><div class="bd" id="auditc" style="max-height:420px;overflow:auto"><div class="k">读取中…</div></div></div>` : ''}
   </div>`;
+  licCard();
+  if (SERVER() && isAdmin()) { usersCard(); auditCard(); }
+  // 外部接口总开关（数据不出内网的客户关掉）
+  $('#vb').closest('.row').insertAdjacentHTML('afterend', `<div class="row"><span ${T('关掉后只能用内网里的模型服务（本机 Ollama、内网的 Mage-VL / vLLM 等），任何画面都不会发到外部服务器。' + (st.allow_external_locked ? '<br>部署时已用环境变量 EDP_ALLOW_EXTERNAL 固定，界面上不能改' : ''))}>允许外部接口</span><label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="allowext" ${st.allow_external ? 'checked' : ''} ${st.allow_external_locked ? 'disabled' : ''}> ${st.allow_external ? '允许' : '已关闭（数据不出内网）'}</label></div>`);
+  $('#akey').placeholder = st.api_key ? '已保存（加密存储），不改就留着' : 'sk-...';
+  if (!isAdmin()) {  // 标注员只能看设置，不能改（外观除外）
+    main.querySelectorAll('.setgrid input, .setgrid select, .setgrid button').forEach(el => { if (!el.closest('.look')) el.disabled = true; });
+    main.querySelector('.phead .meta').textContent = '只有管理员可以修改设置';
+  }
   const VC = {items: []};
   const drawVocab = () => {
     $('#vocab').innerHTML = `<div class="hint" style="margin:0 0 8px">模型给每段标动作时只能从这里选一个词。定义会写进提示词，写得越清楚，模型越不容易选错；近义词用于把模型写的其他说法自动改成词表里的词（用空格分隔）。改动后版本号加一，并写进导出的标注文件。</div>
@@ -1404,10 +1436,152 @@ routes['settings'] = async () => {
     if (e.target.id === 'tst') { $('#tres').textContent = '正在让模型看一张测试图（首次加载模型可能要几十秒）…'; const r = await api('/api/vlm/test', {method:'POST'}); $('#tres').innerHTML = r.ok ? `<span style="color:var(--ok)">✓ ${esc(r.model)} 回答用时 ${r.sec} s：</span><span class="mono">${esc(JSON.stringify(r.answer))}</span>` : `<span style="color:var(--bad)">${esc(r.msg)}</span>`; }
     if (e.target.id === 'tstb') { $('#tres').textContent = '正在提交测试批量任务（最多等 90 秒）…'; const r = await api('/api/batchq/test', {method:'POST'}); $('#tres').innerHTML = `<span style="color:${r.ok?'var(--ok)':r.id?'var(--warn)':'var(--bad)'}">${esc(r.msg)}</span>`; return; }
     if (e.target.id === 'saminst') { await api('/api/sam/install', {method:'POST'}); toast('开始安装，大约需要下载 3 GB'); }
+    if (e.target.id === 'allowext') { await api('/api/settings', {method:'PUT', body:{allow_external: e.target.checked}}); toast(e.target.checked ? '已允许使用外部接口' : '已关闭外部接口：只能用内网模型'); route(); return; }
+    if (e.target.id === 'licup') { $('#licf').click(); return; }
+    if (e.target.id === 'uadd') { userDlg(); return; }
+    const ue = e.target.closest('[data-uedit]'); if (ue) { userDlg(USERS.find(u => u.id === +ue.dataset.uedit)); return; }
     if (e.target.id === 'fine') { await api('/api/settings', {method:'PUT', body:{fine_annotation: e.target.checked}}); toast(e.target.checked ? '已开启精细标注' : '已关闭精细标注'); }
     if (e.target.id === 'clean') { const r = await api('/api/cleanup', {method:'POST'}); toast('释放 ' + fmtB(r.freed)); }
     const o = e.target.closest('[data-open]'); if (o) await api('/api/open', {method:'POST', body:{path:o.dataset.open}});
   };
 };
 
-route();
+/* ================================================================ 登录、账号、授权 */
+function showLogin(msg) {
+  if (document.querySelector('.login')) return;
+  clearTimers();
+  const d = document.createElement('div'); d.className = 'login';
+  d.innerHTML = `<form class="lcard" autocomplete="on">
+    <div class="lbrand">${document.querySelector('nav .brand').innerHTML}<span>具身数据平台</span></div>
+    ${ME.needs_setup ? '<div class="hint" style="color:var(--warn)">还没有任何账号。请在服务器上运行<br><span class="mono">python -m app.manage create-admin admin</span><br>创建管理员后再登录。</div>' : ''}
+    <label>用户名<input type="text" id="lu" autocomplete="username" autofocus></label>
+    <label>密码<input type="password" id="lp" autocomplete="current-password"></label>
+    <div class="lerr" id="lerr">${esc(msg || '')}</div>
+    <button class="btn pri" type="submit">登录</button>
+    <div class="k" style="text-align:center">${esc(ME.version ? 'v' + ME.version : '')}</div></form>`;
+  document.body.appendChild(d);
+  d.querySelector('form').onsubmit = async e => {
+    e.preventDefault();
+    try { await api('/api/login', {method:'POST', body:{username: $('#lu').value, password: $('#lp').value}}); location.reload(); }
+    catch (err) { $('#lerr').textContent = err.message; }
+  };
+  setTimeout(() => $('#lu') && $('#lu').focus(), 50);
+}
+
+function drawBanner() {
+  const L = ME.license || {}; const main = $('#main'); if (!main) return;
+  const old = main.querySelector('.banner'); if (old) old.remove();
+  let h = '';
+  if (!L.valid) h = `<b>未授权：</b>${esc(L.reason || '没有许可证')}。不能开始新的处理；浏览、校对、导出已有结果不受影响。${isAdmin() ? '<a href="#/settings">上传许可证</a>' : '请联系管理员。'}`;
+  else if (L.warn) h = `许可证将在 <b>${L.days_left}</b> 天后（${esc(L.expires)}）到期，请及时续期。`;
+  if (!h) return;
+  const ph = main.querySelector('.phead');
+  const html = `<div class="banner ${L.valid ? 'warn' : 'bad'}">${h}</div>`;
+  if (ph) ph.insertAdjacentHTML('afterend', html); else main.insertAdjacentHTML('afterbegin', html);
+}
+
+async function licCard() {
+  const el = $('#licc'); if (!el) return;
+  const L = await api('/api/license');
+  const i = L.info || {};
+  const MODS = L.modules_all || {};
+  el.innerHTML = `<dl class="kv">
+    <dt>状态</dt><dd>${L.valid ? `<span style="color:var(--ok)">有效</span>${L.warn ? `<span style="color:var(--warn)"> · ${L.days_left} 天后到期</span>` : ''}` : `<span style="color:var(--bad)">${esc(L.reason)}</span>`}</dd>
+    ${i.customer ? `<dt>授权给</dt><dd>${esc(i.customer)}${i.edition === 'trial' ? ' <span class="k">（试用）</span>' : ''}</dd>
+    <dt>有效期</dt><dd>${esc(i.issued)} 至 ${i.expires ? esc(i.expires) : '永久'}</dd>
+    <dt>显卡</dt><dd>${i.max_gpus ? `最多 ${i.max_gpus} 张（当前 ${L.gpus} 张）` : `不限（当前 ${L.gpus} 张）`}</dd>
+    <dt>功能</dt><dd>${(i.modules || []).map(m => esc(MODS[m] || m)).join('<br>')}</dd>
+    <dt>编号</dt><dd class="mono">${esc(i.lic_id)}</dd>` : ''}
+    <dt ${T('签发绑定这台机器的许可证时，把这串发给供应商')}>本机指纹</dt><dd class="mono">${esc(L.fingerprint || '取不到')}</dd></dl>
+    ${isAdmin() ? `<div style="display:flex;gap:8px"><button class="btn pri" id="licup">上传许可证</button><input type="file" id="licf" accept=".lic,.json" hidden></div>` : ''}
+    <div class="hint" style="margin:0">许可证到期或无效时不能开始新的处理；浏览、校对、导出已有结果不受影响。</div>`;
+  const f = $('#licf');
+  if (f) f.onchange = async () => {
+    const fd = new FormData(); fd.append('file', f.files[0]);
+    try { const r = await api('/api/license', {method:'POST', body: fd}); toast(r.valid ? '许可证已更新' : '已保存，但：' + r.reason); ME = await api('/api/me'); licCard(); drawBanner(); }
+    catch (e) { toast(e.message); }
+  };
+}
+
+let USERS = [];
+async function usersCard() {
+  const el = $('#usersc'); if (!el) return;
+  USERS = await api('/api/users');
+  el.innerHTML = `<table class="t"><thead><tr><th>用户名</th><th>姓名</th><th>角色</th><th>最近登录</th><th>状态</th><th></th></tr></thead><tbody>
+    ${USERS.map(u => `<tr><td class="mono">${esc(u.username)}</td><td>${esc(u.name)}</td><td>${esc(ME.roles[u.role] || u.role)}</td>
+      <td class="mono k">${u.last_login ? fmtDate(u.last_login) : '从未'}</td><td>${u.disabled ? '<span style="color:var(--bad)">已停用</span>' : '正常'}</td>
+      <td class="r"><button class="btn sm ghost" data-uedit="${u.id}">修改</button></td></tr>`).join('')}</tbody></table>
+    <div class="hint">管理员：改设置、管理账号、上传许可证、删除项目和批次、看操作日志。标注员：导入、预检、处理、浏览校对、导出。</div>`;
+}
+
+function userDlg(u) {
+  const d = document.createElement('div'); d.className = 'modal';
+  d.innerHTML = `<div class="dlg form"><h3>${u ? '修改账号 ' + esc(u.username) : '添加账号'}</h3>
+    ${u ? '' : '<div class="row"><span>用户名</span><input type="text" id="du" placeholder="字母、数字，例如 zhangsan"></div>'}
+    <div class="row"><span>姓名</span><input type="text" id="dn" value="${esc(u ? u.name : '')}"></div>
+    <div class="row"><span>角色</span><select id="dr">${Object.entries(ME.roles).map(([k, t]) => `<option value="${k}" ${(u ? u.role : 'annotator') === k ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+    <div class="row"><span>${u ? '重设密码' : '密码'}</span><input type="password" id="dp" placeholder="${u ? '不改就留空' : '至少 8 位，含字母和数字'}" autocomplete="new-password"></div>
+    ${u ? `<div class="row"><span>停用</span><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="dd" ${u.disabled ? 'checked' : ''}> 停用后不能登录</label></div>` : ''}
+    <div class="lerr" id="derr"></div>
+    <div class="row"><span class="sp"></span><button class="btn" data-x>取消</button><button class="btn pri" data-ok>保存</button></div></div>`;
+  document.body.appendChild(d);
+  d.onclick = async e => {
+    if (e.target === d || e.target.dataset.x !== undefined) { d.remove(); return; }
+    if (e.target.dataset.ok === undefined) return;
+    try {
+      if (u) await api('/api/users/' + u.id, {method:'PUT', body:{name: $('#dn').value, role: $('#dr').value, password: $('#dp').value || null, disabled: $('#dd').checked}});
+      else await api('/api/users', {method:'POST', body:{username: $('#du').value, name: $('#dn').value, role: $('#dr').value, password: $('#dp').value}});
+      d.remove(); toast('已保存'); usersCard();
+    } catch (err) { $('#derr').textContent = err.message; }
+  };
+}
+
+async function auditCard() {
+  const el = $('#auditc'); if (!el) return;
+  const rows = await api('/api/audit?limit=200');
+  const what = (m, p) => {
+    const R = [[/^\/api\/login$/, '登录'], [/^\/api\/logout$/, '退出'], [/\/start$/, '开始处理'], [/\/rerun$/, '重跑步骤'], [/\/segments$/, '修改分段标注'],
+      [/\/objects$/, '修改物体清单'], [/^\/api\/export$/, '导出数据集'], [/^\/api\/settings$/, '修改设置'], [/^\/api\/vocab$/, '修改动作词表'],
+      [/^\/api\/users/, '管理账号'], [/^\/api\/license$/, '上传许可证'], [/^\/api\/batches$/, '导入批次'], [/^\/api\/batches\/[^/]+$/, m === 'DELETE' ? '删除批次' : '修改批次'],
+      [/^\/api\/projects/, m === 'DELETE' ? '删除项目' : '修改项目'], [/\/pause$/, '暂停'], [/\/resume$/, '继续'], [/\/upload$/, '上传文件']];
+    const hit = R.find(([re]) => re.test(p)); return hit ? hit[1] : m + ' ' + p;
+  };
+  el.innerHTML = rows.length ? `<table class="t"><thead><tr><th>时间</th><th>账号</th><th>操作</th><th>对象</th><th>结果</th><th>来源</th></tr></thead><tbody>
+    ${rows.map(r => `<tr><td class="mono k nowrap">${fmtDate(r.ts)}</td><td class="mono">${esc(r.user || '—')}</td><td>${esc(what(r.method, r.path))}</td>
+      <td class="mono k" style="font-size:11.5px">${esc(shortText(r.path.replace(/^\/api\//, '')))}</td>
+      <td>${r.status < 300 ? '<span style="color:var(--ok)">成功</span>' : `<span style="color:var(--bad)">${r.status === 403 ? '无权限' : r.status === 401 ? '失败' : r.status}</span>`}${r.detail && r.detail !== '登录' && r.detail !== '退出' ? ' <span class="k">' + esc(r.detail) + '</span>' : ''}</td>
+      <td class="mono k">${esc(r.ip || '')}</td></tr>`).join('')}</tbody></table>` : '<div class="k">暂无</div>';
+}
+
+routes['account'] = async () => {
+  const main = $('#main');
+  const u = ME.user || {};
+  main.innerHTML = pageHead({title: '我的账号'}) + `<div class="setgrid">
+    <div class="card"><h2>账号</h2><div class="bd"><dl class="kv"><dt>用户名</dt><dd class="mono">${esc(u.username)}</dd><dt>姓名</dt><dd>${esc(u.name)}</dd>
+      <dt>角色</dt><dd>${esc((ME.roles || {})[u.role] || u.role)}</dd><dt>版本</dt><dd>${esc(ME.version)}</dd></dl>
+      <div style="margin-top:12px"><button class="btn" id="logout">退出登录</button></div></div></div>
+    <div class="card"><h2>修改密码</h2><div class="bd form">
+      <div class="row"><span>原密码</span><input type="password" id="po" autocomplete="current-password"></div>
+      <div class="row"><span>新密码</span><input type="password" id="pn" autocomplete="new-password" placeholder="至少 8 位，含字母和数字"></div>
+      <div class="row"><span>再输一遍</span><input type="password" id="pn2" autocomplete="new-password"></div>
+      <div class="lerr" id="perr"></div><div><button class="btn pri" id="pw">修改</button></div></div></div></div>`;
+  $('#logout').onclick = async () => { await api('/api/logout', {method:'POST'}); location.hash = '#/'; location.reload(); };
+  $('#pw').onclick = async () => {
+    if ($('#pn').value !== $('#pn2').value) { $('#perr').textContent = '两次输入的新密码不一致'; return; }
+    try { await api('/api/me/password', {method:'PUT', body:{old: $('#po').value, new: $('#pn').value}}); toast('密码已修改，请重新登录'); setTimeout(() => location.reload(), 1200); }
+    catch (e) { $('#perr').textContent = e.message; }
+  };
+};
+
+async function boot() {
+  try { ME = await api('/api/me'); } catch (e) { /* 后台没起来时照常画，左下角会显示后台未响应 */ }
+  const brand = document.querySelector('nav .brand');
+  if (brand) brand.dataset.tip = '百行 · 具身数据平台' + (ME.version ? ' v' + ME.version : '') + (SERVER() ? ' · 服务器部署' : ' · 本机部署');
+  if (SERVER()) {
+    if (!ME.user) { showLogin(); return; }
+    const set = document.querySelector('nav a[data-r="settings"]');
+    set.insertAdjacentHTML('beforebegin', `<a href="#/account" data-r="account" class="me" data-tip="${esc(ME.user.name || ME.user.username)} · ${esc((ME.roles || {})[ME.user.role] || '')}"><span>${esc((ME.user.name || ME.user.username).slice(0, 1).toUpperCase())}</span></a>`);
+  }
+  route();
+}
+boot();

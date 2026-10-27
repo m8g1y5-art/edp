@@ -171,6 +171,7 @@ def migrate():
     """启动时调用：先按版本号升级数据库结构（升级前自动备份），再套用默认值更新和部署预设"""
     from . import migrations
     migrations.upgrade()
+    encrypt_existing()
     for flag, vals in _MIGRATIONS.items():
         if not q("SELECT 1 FROM settings WHERE key=?", (flag,), one=True):
             for k, v in vals.items():
@@ -192,23 +193,82 @@ def migrate():
             print("preset.json 读取失败：", e)
 
 
+# 敏感设置（外部接口的 API Key）加密后存进数据库；密钥文件 secret.key 在数据目录里，和数据库分开备份更安全
+SECRET_KEYS = {"api_key"}
+MASK = "********"
+_fernet = {"f": None}
+
+
+def _cipher():
+    if _fernet["f"] is None:
+        from cryptography.fernet import Fernet
+        kf = Path(os.environ.get("EDP_SECRET_FILE") or (DATA / "secret.key"))
+        if not kf.exists():
+            kf.write_bytes(Fernet.generate_key())
+            try:
+                os.chmod(kf, 0o600)
+            except Exception:
+                pass
+        _fernet["f"] = Fernet(kf.read_bytes().strip())
+    return _fernet["f"]
+
+
+def _dec(k, v):
+    if k in SECRET_KEYS and isinstance(v, str) and v.startswith("enc:"):
+        try:
+            return _cipher().decrypt(v[4:].encode()).decode()
+        except Exception:
+            return ""
+    return v
+
+
 def get_setting(k):
     r = q("SELECT value FROM settings WHERE key=?", (k,), one=True)
-    return jl(r["value"], None) if r else DEFAULT_SETTINGS.get(k)
+    return _dec(k, jl(r["value"], None)) if r else DEFAULT_SETTINGS.get(k)
 
 
 def set_setting(k, v):
+    if k in SECRET_KEYS and isinstance(v, str):
+        if v.startswith(MASK):  # 界面上显示的是遮住的值，没改动就不覆盖
+            return
+        v = ("enc:" + _cipher().encrypt(v.encode()).decode()) if v else ""
     x("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, jd(v)))
 
 
-def all_settings():
+def all_settings(mask=False):
     out = dict(DEFAULT_SETTINGS)
     for r in q("SELECT key,value FROM settings"):
-        out[r["key"]] = jl(r["value"], None)
+        out[r["key"]] = _dec(r["key"], jl(r["value"], None))
+    if mask:
+        for k in SECRET_KEYS:
+            if out.get(k):
+                out[k] = MASK + str(out[k])[-4:]
     return out
 
 
+def encrypt_existing():
+    """旧版本明文存的密钥改成加密存储（启动时执行，已加密的跳过）"""
+    for k in SECRET_KEYS:
+        r = q("SELECT value FROM settings WHERE key=?", (k,), one=True)
+        v = jl(r["value"], None) if r else None
+        if isinstance(v, str) and v and not v.startswith("enc:"):
+            set_setting(k, v)
+
+
+_ID = __import__("re").compile(r"^[A-Za-z0-9_\-][A-Za-z0-9_.\-]{0,127}$")
+
+
+def safe_id(v):
+    """批次号、录制号只能是普通的名字，防止用 .. 之类的路径读到数据目录以外的文件"""
+    if not isinstance(v, str) or not _ID.match(v) or ".." in v:
+        raise ValueError(f"非法的编号：{v!r}")
+    return v
+
+
 def work_dir(batch_id, rec_id=None):
+    safe_id(batch_id)
+    if rec_id:
+        safe_id(rec_id)
     p = DATA / "batches" / batch_id
     if rec_id:
         p = p / rec_id
