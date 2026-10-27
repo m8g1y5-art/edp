@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+data/
+preset.json
+build/
+dist/
+*.bundle
+.venv/
+license/private_key.pem
+*.lic

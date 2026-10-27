@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-accent="cyan">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>百行 · 具身数据平台</title>
+<script>
+/* 外观设置存在本机浏览器里；先于样式应用，避免刷新时闪一下 */
+(function(){try{var t=localStorage.getItem('edp_theme')||'dark',a=localStorage.getItem('edp_accent')||'cyan';
+if(t==='system')t=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
+document.documentElement.dataset.theme=t;document.documentElement.dataset.accent=a;}catch(e){}})();
+</script>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%22-70 -122 140 140%22%3E%3Cstyle%3E.i%7Bfill:%2314171B%7D.a%7Bfill:%230A9EC1%7D%40media%28prefers-color-scheme:dark%29%7B.i%7Bfill:%23E9EBEE%7D.a%7Bfill:%233DD6F5%7D%7D%3C/style%3E%3Crect class=%22i%22 x=%22-9%22 y=%22-118%22 width=%2218%22 height=%2270%22 rx=%229%22/%3E%3Cg transform=%22scale%281.4%29 translate%280 -14%29%22%3E%3Crect class=%22i%22 x=%22-8%22 y=%22-60%22 width=%2216%22 height=%2230%22 rx=%224%22/%3E%3Crect class=%22i%22 x=%22-46%22 y=%22-34%22 width=%2292%22 height=%2216%22 rx=%228%22/%3E%3Crect class=%22i%22 x=%22-46%22 y=%22-34%22 width=%2216%22 height=%2266%22 rx=%228%22/%3E%3Crect class=%22i%22 x=%2230%22 y=%22-34%22 width=%2216%22 height=%2266%22 rx=%228%22/%3E%3Crect class=%22a%22 x=%22-16%22 y=%220%22 width=%2232%22 height=%2232%22 rx=%226%22/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css?v=5">
+</head>
+<body>
+<div class="app">
+  <nav id="nav">
+    <a class="brand" href="#/" data-tip="百行 · 具身数据平台 · 本机部署"><svg class="logo" viewBox="236 144 985 401" aria-label="百行"><polygon class="i" points="244,250 244,276 407,276 408,321 476,321 477,276 645,276 645,250"/><polygon class="i" points="267,331 261,339 261,527 263,531 270,536 401,536 401,512 322,511 322,355 401,354 401,329 273,329"/><polygon class="i" points="359,417 359,442 526,442 526,417"/><polygon class="i" points="484,329 484,354 563,355 563,511 484,512 484,536 615,536 619,534 624,526 624,339 622,335 612,329"/><polygon class="i" points="828,250 738,250 667,328 717,329 718,331 657,429 672,428 804,329 744,329"/><polygon class="i" points="777,377 715,423 715,536 777,536"/><polygon class="i" points="830,329 830,355 978,356 978,513 902,514 902,536 1036,536 1042,532 1045,526 1045,356 1079,355 1079,329"/><polygon class="i" points="850,250 850,276 1062,276 1062,250"/><rect class="i" x="1152" y="152" width="16" height="80" rx="8"/><g transform="translate(1160 300) scale(1.15)"><rect class="i" x="-8" y="-60" width="16" height="30" rx="4"/><rect class="i" x="-46" y="-34" width="92" height="16" rx="8"/><rect class="i" x="-46" y="-34" width="16" height="66" rx="8"/><rect class="i" x="30" y="-34" width="16" height="66" rx="8"/><rect class="a" x="-16" y="0" width="32" height="32" rx="6"/></g></svg></a>
+    <a href="#/" data-r="projects" data-tip="项目"><svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.8"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.8"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.8"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.8"/></svg></a>
+    <a href="#/queue" data-r="queue" data-tip="任务队列"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h11M4 18h7"/></svg><span id="qn"></span></a>
+    <a href="#/export" data-r="export" data-tip="导出数据集"><svg viewBox="0 0 24 24"><path d="M12 3.5v11m0 0l-4-4m4 4l4-4M4.5 15.5v4h15v-4"/></svg></a>
+    <span class="gap"></span>
+    <div class="sys" id="sys"></div>
+    <a href="#/settings" data-r="settings" data-tip="设置"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg></a>
+  </nav>
+  <main id="main"></main>
+</div>
+<div class="toast" id="toast"><span id="tmsg"></span><button id="undo">撤销</button></div>
+<div id="tip"></div>
+<script src="/static/app.js?v=10"></script>
+</body>
+</html>
